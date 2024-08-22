@@ -45,7 +45,6 @@ futures = { version = "0.3.17", default-features = false, features = [
   "cfg-target-has-atomic",
   "unstable",
 ] }
-heapless = "0.8"
 
 
 embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
@@ -56,6 +55,8 @@ log = "0.4"
 pio-proc = "0.2"
 pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
+# ctap-types = "0.3.0"
+heapless = "0.8.0"
 
 [profile.release]
 debug = 2

@@ -3,19 +3,22 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_rp::flash::Flash;
 use embassy_rp::gpio::{Level, Output};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use {defmt_rtt as _, panic_probe as _};
 
-// mod usb;
-// use usb::new;
+mod usb;
+use usb::create_usb_tasks;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("Starting");
     let p = embassy_rp::init(Default::default());
+
+    // Flash::new_blocking();
 
     // Get board specific pin
     let led_pin = {
@@ -24,7 +27,12 @@ async fn main(spawner: Spawner) {
     };
 
     spawner.spawn(blinker(led_pin)).unwrap();
-    spawner.spawn(new(p.USB)).unwrap();
+
+    let (usb_task, hid_writer_task, hid_reader_task) = create_usb_tasks(p.USB);
+
+    spawner.spawn(usb_task).unwrap();
+    spawner.spawn(hid_writer_task).unwrap();
+    spawner.spawn(hid_reader_task).unwrap();
 }
 
 pub static LED_SIGNAL: Signal<CriticalSectionRawMutex, LedState> = Signal::new();
@@ -51,7 +59,7 @@ pub async fn blinker(mut led: Output<'static>) {
 
         let (on_time, off_time) = match signal {
             LedState::Confirm => (Duration::from_secs(1), Duration::from_millis(100)),
-            LedState::Idle => (Duration::from_millis(500), Duration::from_secs(2)),
+            LedState::Idle => (Duration::from_millis(500), Duration::from_secs(1)),
             LedState::Active => (Duration::from_millis(200), Duration::from_millis(200)),
             LedState::Processing => (Duration::from_millis(50), Duration::from_millis(50)),
         };
