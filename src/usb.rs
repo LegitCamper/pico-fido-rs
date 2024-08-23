@@ -1,8 +1,9 @@
 use embassy_executor::SpawnToken;
-use embassy_rp::clocks::RoscRng;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_rp::{bind_interrupts, usb::InterruptHandler};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel::{Channel, Receiver};
 use embassy_time::Timer;
 use embassy_usb::class::hid::HidReader;
 use embassy_usb::class::hid::HidWriter;
@@ -10,11 +11,10 @@ use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 use static_cell::StaticCell;
-use usbd_hid::descriptor::{MouseReport, SerializedDescriptor};
+use usbd_hid::descriptor::{CtapReport, KeyboardReport, KeyboardUsage, SerializedDescriptor};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::*;
-use rand::Rng;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -29,17 +29,17 @@ async fn run_usb(mut usb: UsbDevice<'static, Driver<'static, USB>>) {
 }
 
 #[embassy_executor::task]
-async fn usb_hid_in(mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRITER_WRITE_N>) {
-    let mut rng = RoscRng;
-
+async fn usb_hid_keyboard_in(
+    mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRITER_WRITE_N>,
+    receiver: Receiver<'static, NoopRawMutex, KeyboardUsage, 12>,
+) {
     loop {
-        _ = Timer::after_secs(1).await;
-        let report = MouseReport {
-            buttons: 0,
-            x: rng.gen_range(-100..100), // random small x movement
-            y: rng.gen_range(-100..100), // random small y movement
-            wheel: 0,
-            pan: 0,
+        let key = receiver.receive().await;
+        let report = KeyboardReport {
+            modifier: 0,
+            reserved: 0,
+            leds: 0,
+            keycodes: [key as u8, 0, 0, 0, 0, 0],
         };
         // Send the report.
         match writer.write_serialize(&report).await {
@@ -50,14 +50,39 @@ async fn usb_hid_in(mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRI
 }
 
 #[embassy_executor::task]
-async fn usb_hid_out(reader: HidReader<'static, Driver<'static, USB>, HID_READ_READ_N>) {
+async fn usb_hid_ctap_in(mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRITER_WRITE_N>) {
+    loop {
+        _ = Timer::after_secs(1).await;
+        let report = CtapReport {
+            data_in: [0; 64],
+            data_out: [0; 64],
+        };
+        // Send the report.
+        match writer.write_serialize(&report).await {
+            Ok(()) => {}
+            Err(e) => warn!("Failed to send report: {:?}", e),
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn usb_hid_keyboard_out(reader: HidReader<'static, Driver<'static, USB>, HID_READ_READ_N>) {
+    let mut request_handler = UsbRequestHandler {};
+    reader.run(false, &mut request_handler).await;
+}
+
+#[embassy_executor::task]
+async fn usb_hid_ctap_out(reader: HidReader<'static, Driver<'static, USB>, HID_READ_READ_N>) {
     let mut request_handler = UsbRequestHandler {};
     reader.run(false, &mut request_handler).await;
 }
 
 pub fn create_usb_tasks(
     usb: USB,
+    hid_keyboard_channel: &'static Channel<NoopRawMutex, KeyboardUsage, 12>,
 ) -> (
+    SpawnToken<impl Sized>,
+    SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
@@ -96,36 +121,51 @@ pub fn create_usb_tasks(
         CONTROL_BUF.init([0; 64]),
     );
 
+    static DEVICE_HANDLER: StaticCell<UsbHandler> = StaticCell::new();
+    builder.handler(DEVICE_HANDLER.init(UsbHandler::new()));
+
     // Tell usb what our composite classes are
     builder.function(0x03, 0x00, 0x00); // HID
     builder.function(0x0B, 0x00, 0x00); // CCID
 
-    static DEVICE_HANDLER: StaticCell<UsbHandler> = StaticCell::new();
-    builder.handler(DEVICE_HANDLER.init(UsbHandler::new()));
+    // Create the usb classes
 
-    static STATE: StaticCell<State> = StaticCell::new();
-
-    // Create an hid class config
-    let config = embassy_usb::class::hid::Config {
-        report_descriptor: MouseReport::desc(),
-        request_handler: None,
-        poll_ms: 60,
-        max_packet_size: 64,
+    let hid_keyboard = {
+        let config = embassy_usb::class::hid::Config {
+            report_descriptor: KeyboardReport::desc(),
+            request_handler: None,
+            poll_ms: 60,
+            max_packet_size: 64,
+        };
+        static STATE: StaticCell<State> = StaticCell::new();
+        HidReaderWriter::<_, 1, 8>::new(&mut builder, STATE.init(State::new()), config)
     };
-    let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, STATE.init(State::new()), config);
+    let (hid_keyboard_reader, hid_keyboard_writer) = hid_keyboard.split();
+
+    let hid_ctap = {
+        let config = embassy_usb::class::hid::Config {
+            report_descriptor: CtapReport::desc(),
+            request_handler: None,
+            poll_ms: 60,
+            max_packet_size: 64,
+        };
+        static STATE: StaticCell<State> = StaticCell::new();
+        HidReaderWriter::<_, 1, 8>::new(&mut builder, STATE.init(State::new()), config)
+    };
+    let (hid_ctap_reader, hid_ctap_writer) = hid_ctap.split();
 
     // CREATE THE CCID CONFIG AND READER/WRITER HERE
 
     // Build the builder.
     let usb = builder.build();
 
-    let (hid_reader, hid_writer) = hid.split();
-
     // return usb tasks
     (
         run_usb(usb),
-        usb_hid_in(hid_writer),
-        usb_hid_out(hid_reader),
+        usb_hid_keyboard_in(hid_keyboard_writer, hid_keyboard_channel.receiver()),
+        usb_hid_ctap_in(hid_ctap_writer),
+        usb_hid_keyboard_out(hid_keyboard_reader),
+        usb_hid_ctap_out(hid_ctap_reader),
     )
 }
 

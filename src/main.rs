@@ -6,8 +6,12 @@ use embassy_executor::Spawner;
 use embassy_rp::flash::Flash;
 use embassy_rp::gpio::{Level, Output};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
+use static_cell::StaticCell;
+use usbd_hid::descriptor::KeyboardUsage;
 use {defmt_rtt as _, panic_probe as _};
 
 mod usb;
@@ -25,14 +29,23 @@ async fn main(spawner: Spawner) {
         #[cfg(feature = "rp2040_board")]
         Output::new(p.PIN_25, Level::Low)
     };
-
     spawner.spawn(blinker(led_pin)).unwrap();
 
-    let (usb_task, hid_writer_task, hid_reader_task) = create_usb_tasks(p.USB);
+    // This is only meant for entering 2fa codes (typically 6 chars)
+    static HID_KEYBOARD_CHANNEL: StaticCell<Channel<NoopRawMutex, KeyboardUsage, 12>> =
+        StaticCell::new();
+
+    let (usb_task, hid_keyboard_writer, hid_ctap_writer, hid_keyboard_reader, hid_ctap_reader) =
+        create_usb_tasks(
+            p.USB,
+            HID_KEYBOARD_CHANNEL.init(Channel::<NoopRawMutex, KeyboardUsage, 12>::new()),
+        );
 
     spawner.spawn(usb_task).unwrap();
-    spawner.spawn(hid_writer_task).unwrap();
-    spawner.spawn(hid_reader_task).unwrap();
+    spawner.spawn(hid_keyboard_writer).unwrap();
+    spawner.spawn(hid_ctap_writer).unwrap();
+    spawner.spawn(hid_keyboard_reader).unwrap();
+    spawner.spawn(hid_ctap_reader).unwrap();
 }
 
 pub static LED_SIGNAL: Signal<CriticalSectionRawMutex, LedState> = Signal::new();
