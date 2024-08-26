@@ -3,25 +3,29 @@ use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_rp::{bind_interrupts, usb::InterruptHandler};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::channel::{Channel, Receiver};
+use embassy_sync::channel::Receiver;
 use embassy_time::Timer;
-use embassy_usb::class::hid::HidReader;
-use embassy_usb::class::hid::HidWriter;
+use embassy_usb::class::hid::{HidReader, HidWriter, ReadError};
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
-use static_cell::StaticCell;
-use usbd_hid::descriptor::{CtapReport, KeyboardReport, KeyboardUsage, SerializedDescriptor};
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::*;
+use static_cell::StaticCell;
+use usbd_hid::descriptor::{CtapReport, KeyboardReport, KeyboardUsage, SerializedDescriptor};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
-const HID_WRITER_WRITE_N: usize = 8;
-const HID_READ_READ_N: usize = 1;
+const HID_WRITER_BUF: usize = 8;
+const HID_READER_BUF: usize = 1;
+const CTAP_WRITER_BUF: usize = 8;
+// https://fidoalliance.org/specs/fido-v2.0-id-20180227/fido-client-to-authenticator-protocol-v2.0-id-20180227.html#usb-message-and-packet-structure
+// length is 64 - 7 + 128 * (64 - 5) = 7609 bytes.
+const CTAP_READER_BUF: usize = 7609;
 
 #[embassy_executor::task]
 async fn run_usb(mut usb: UsbDevice<'static, Driver<'static, USB>>) {
@@ -30,62 +34,90 @@ async fn run_usb(mut usb: UsbDevice<'static, Driver<'static, USB>>) {
 
 #[embassy_executor::task]
 async fn usb_hid_keyboard_in(
-    mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRITER_WRITE_N>,
+    mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRITER_BUF>,
     receiver: Receiver<'static, NoopRawMutex, KeyboardUsage, 12>,
 ) {
-    loop {
-        let key = receiver.receive().await;
+    async fn send_key(
+        writer: &mut HidWriter<'static, Driver<'static, USB>, HID_WRITER_BUF>,
+        key: u8,
+    ) {
         let report = KeyboardReport {
             modifier: 0,
             reserved: 0,
             leds: 0,
-            keycodes: [key as u8, 0, 0, 0, 0, 0],
+            keycodes: [key, 0, 0, 0, 0, 0],
         };
         // Send the report.
-        match writer.write_serialize(&report).await {
-            Ok(()) => {}
-            Err(e) => warn!("Failed to send report: {:?}", e),
+        if let Err(e) = writer.write_serialize(&report).await {
+            warn!("Failed to send report: {:?}", e)
         }
+    }
+
+    loop {
+        let key = receiver.receive().await;
+        send_key(&mut writer, key as u8).await;
+        send_key(&mut writer, 0).await; // unpress key
     }
 }
 
 #[embassy_executor::task]
-async fn usb_hid_ctap_in(mut writer: HidWriter<'static, Driver<'static, USB>, HID_WRITER_WRITE_N>) {
+async fn usb_ctap_in(mut writer: HidWriter<'static, Driver<'static, USB>, CTAP_WRITER_BUF>) {
     loop {
-        _ = Timer::after_secs(1).await;
         let report = CtapReport {
             data_in: [0; 64],
             data_out: [0; 64],
         };
         // Send the report.
-        match writer.write_serialize(&report).await {
-            Ok(()) => {}
-            Err(e) => warn!("Failed to send report: {:?}", e),
+        if let Err(e) = writer.write_serialize(&report).await {
+            warn!("Failed to send report: {:?}", e)
         }
     }
 }
 
 #[embassy_executor::task]
-async fn usb_hid_keyboard_out(reader: HidReader<'static, Driver<'static, USB>, HID_READ_READ_N>) {
+async fn usb_hid_keyboard_out(reader: HidReader<'static, Driver<'static, USB>, HID_READER_BUF>) {
     let mut request_handler = UsbRequestHandler {};
     reader.run(false, &mut request_handler).await;
 }
 
 #[embassy_executor::task]
-async fn usb_hid_ctap_out(reader: HidReader<'static, Driver<'static, USB>, HID_READ_READ_N>) {
-    let mut request_handler = UsbRequestHandler {};
-    reader.run(false, &mut request_handler).await;
+async fn usb_ctap_out(mut reader: HidReader<'static, Driver<'static, USB>, CTAP_READER_BUF>) {
+    let mut buf = [0; CTAP_READER_BUF];
+    // This is only used when receivng Sync
+    // (The message(s) was too big to fit in one packget)
+    let mut multi_buf: Vec<u8> = Vec::new();
+
+    fn handle_response(buf: &[u8]) {}
+
+    loop {
+        let resp = reader.read(&mut buf).await;
+        match resp {
+            Ok(_) => (),
+            Err(ReadError::BufferOverflow) => warn!("Usb got BufferOverflow (Buffer too small)"),
+            Err(ReadError::Disabled) => warn!("Ctap usb reader got Disabled)"),
+            Err(ReadError::Sync(_length_buf)) => {
+                multi_buf.extend_from_slice(&buf);
+            }
+        };
+        if multi_buf.is_empty() {
+            handle_response(&buf);
+        } else {
+            handle_response(&multi_buf);
+            multi_buf.drain(..);
+        }
+    }
 }
 
 pub fn create_usb_tasks(
     usb: USB,
-    hid_keyboard_channel: &'static Channel<NoopRawMutex, KeyboardUsage, 12>,
+    keyboard_reciever: Receiver<'static, NoopRawMutex, KeyboardUsage, 12>,
 ) -> (
     SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
     SpawnToken<impl Sized>,
+    // SpawnToken<impl Sized>,
 ) {
     let driver = Driver::new(usb, Irqs);
 
@@ -138,6 +170,7 @@ pub fn create_usb_tasks(
             max_packet_size: 64,
         };
         static STATE: StaticCell<State> = StaticCell::new();
+        // TODO: This could probably just be a HidWriter
         HidReaderWriter::<_, 1, 8>::new(&mut builder, STATE.init(State::new()), config)
     };
     let (hid_keyboard_reader, hid_keyboard_writer) = hid_keyboard.split();
@@ -150,7 +183,11 @@ pub fn create_usb_tasks(
             max_packet_size: 64,
         };
         static STATE: StaticCell<State> = StaticCell::new();
-        HidReaderWriter::<_, 1, 8>::new(&mut builder, STATE.init(State::new()), config)
+        HidReaderWriter::<_, CTAP_READER_BUF, CTAP_WRITER_BUF>::new(
+            &mut builder,
+            STATE.init(State::new()),
+            config,
+        )
     };
     let (hid_ctap_reader, hid_ctap_writer) = hid_ctap.split();
 
@@ -162,10 +199,11 @@ pub fn create_usb_tasks(
     // return usb tasks
     (
         run_usb(usb),
-        usb_hid_keyboard_in(hid_keyboard_writer, hid_keyboard_channel.receiver()),
-        usb_hid_ctap_in(hid_ctap_writer),
+        usb_hid_keyboard_in(hid_keyboard_writer, keyboard_reciever),
+        usb_ctap_in(hid_ctap_writer),
         usb_hid_keyboard_out(hid_keyboard_reader),
-        usb_hid_ctap_out(hid_ctap_reader),
+        usb_ctap_out(hid_ctap_reader),
+        // usb_hid_ctap_run(hid_ctap),
     )
 }
 
@@ -236,5 +274,3 @@ impl Handler for UsbHandler {
         }
     }
 }
-
-mod fido_class {}

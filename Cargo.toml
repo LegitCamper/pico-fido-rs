@@ -19,6 +19,7 @@ embassy-executor = { version = "0.6.0", features = [
   "executor-interrupt",
   "defmt",
   "integrated-timers",
+  "nightly",
 ] }
 embassy-time = { version = "0.3.2", features = [
   "defmt",
@@ -29,6 +30,7 @@ embassy-rp = { version = "0.2.0", features = [
   "unstable-pac",
   "time-driver",
   "critical-section-impl",
+  "intrinsics",
 ] }
 embassy-futures = { version = "0.1.0" }
 embassy-usb = { version = "0.3.0", features = ["defmt"] }
@@ -50,13 +52,23 @@ futures = { version = "0.3.17", default-features = false, features = [
 embedded-io-async = { version = "0.6.1", features = ["defmt-03"] }
 embedded-storage = { version = "0.3" }
 static_cell = "2"
-portable-atomic = { version = "1.5", features = ["critical-section"] }
 log = "0.4"
 pio-proc = "0.2"
 pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
-# ctap-types = "0.3.0"
+ctap-types = "0.3.0"
 heapless = "0.8.0"
+portable-atomic = { version = "1.7.0", features = ["critical-section"] }
+p256 = { version = "0.13.2", default-features = false, features = [
+  "arithmetic",
+  "ecdsa",
+  "pem",
+  "ecdh",
+] }
+embedded-alloc = "0.5.1"
 
 [profile.release]
 debug = 2
+
+[patch.crates-io]
+delog = { version = "0.1", git = "https://github.com/trussed-dev/delog/", rev = "869167f7ff0630518c86f30afd215fee124d19c1" }
